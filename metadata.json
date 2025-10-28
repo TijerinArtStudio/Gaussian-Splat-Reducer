@@ -1,0 +1,5 @@
+{
+  "name": "Gaussian Splat Reducer",
+  "description": "An intelligent tool to reduce the number of splats in a .ply file from Gaussian Splatting, optimizing 3D scenes by removing less important splats based on opacity and size.",
+  "requestFramePermissions": []
+}
