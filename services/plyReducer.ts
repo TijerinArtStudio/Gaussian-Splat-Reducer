@@ -8,10 +8,6 @@ type StatusCallback = (
     counts?: { original: number, reduced: number }
 ) => void;
 
-// Configuration for score calculation
-const W_OPACITY = 0.7;
-const W_SIZE = 0.3;
-
 // --- Helper Functions ---
 
 const readPlyHeader = (buffer: ArrayBuffer): { header: string; dataOffset: number; vertexCount: number } => {
@@ -24,7 +20,9 @@ const readPlyHeader = (buffer: ArrayBuffer): { header: string; dataOffset: numbe
   const endHeaderToken = 'end_header\n';
   let headerEndIndex = -1;
 
-  for (let i = 0; i < view.length - endHeaderToken.length + 1; i++) {
+  // Search for end_header, considering the buffer might be large
+  const searchEnd = Math.min(view.length, 4096); // Search in the first 4KB
+  for (let i = 0; i < searchEnd - endHeaderToken.length + 1; i++) {
     const chunk = decoder.decode(view.slice(i, i + endHeaderToken.length));
     if (chunk === endHeaderToken) {
         headerEndIndex = i + endHeaderToken.length;
@@ -49,12 +47,16 @@ const readPlyHeader = (buffer: ArrayBuffer): { header: string; dataOffset: numbe
   return { header, dataOffset, vertexCount };
 };
 
+export const getVertexCount = async (file: File | Blob): Promise<number> => {
+    const buffer = await file.arrayBuffer();
+    const { vertexCount } = readPlyHeader(buffer);
+    return vertexCount;
+}
+
 const parseSplatData = (buffer: ArrayBuffer, dataOffset: number, vertexCount: number): Splat[] => {
   const dataView = new DataView(buffer, dataOffset);
   const splats: Splat[] = [];
-  // Per Gaussian Splatting standard, properties are 3x pos, 3x color, 1x opacity, 3x scale, 4x rot = 14 floats
-  // This is a simplified parser assuming this structure.
-  const bytesPerSplat = 14 * 4; // 14 floats * 4 bytes/float
+  const bytesPerSplat = 14 * 4; // 56 bytes
   
   if (dataView.byteLength < vertexCount * bytesPerSplat) {
       throw new Error(`Buffer is too small for the declared number of vertices. Expected at least ${vertexCount * bytesPerSplat} bytes, but got ${dataView.byteLength}.`);
@@ -117,71 +119,135 @@ const generatePlyFile = (splats: Splat[], originalHeader: string): Blob => {
   return new Blob([headerBytes, buffer], { type: 'application/octet-stream' });
 };
 
+// --- Color Calculation Helpers ---
+
+const hexToRgb = (hex: string): { r: number; g: number; b: number } => {
+  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return result
+    ? {
+        r: parseInt(result[1], 16),
+        g: parseInt(result[2], 16),
+        b: parseInt(result[3], 16),
+      }
+    : { r: 0, g: 0, b: 0 };
+};
+
+const SH_C0 = 0.28209479177;
+const shToRgb = (splat: Splat): { r: number; g: number; b: number } => {
+    let r = 0.5 + SH_C0 * splat.f_dc_0;
+    let g = 0.5 + SH_C0 * splat.f_dc_1;
+    let b = 0.5 + SH_C0 * splat.f_dc_2;
+    
+    r = Math.max(0, Math.min(1, r)) * 255;
+    g = Math.max(0, Math.min(1, g)) * 255;
+    b = Math.max(0, Math.min(1, b)) * 255;
+
+    return { r, g, b };
+}
+
+const colorDistance = (
+  color1: { r: number; g: number; b: number },
+  color2: { r: number; g: number; b: number }
+): number => {
+  const dr = color1.r - color2.r;
+  const dg = color1.g - color2.g;
+  const db = color1.b - color2.b;
+  return Math.sqrt(dr * dr + dg * dg + db * db);
+};
+
+
 // --- Main Reducer Logic ---
 
-export const reduceSplatsInFile = async (
-    file: File, 
-    percentage: number,
+const sigmoid = (t: number) => 1 / (1 + Math.exp(-t));
+
+export const reduceSplatsByProperties = async (
+    file: File | Blob,
+    opacityThresholdPercent: number, // 0-100
+    scaleThresholdPercent: number, // 0-100
     statusCallback: StatusCallback
 ): Promise<Blob> => {
-    // 1. Loading and Parsing
-    statusCallback('loading', `Loading file: ${file.name}...`);
+    statusCallback('loading', `Loading and parsing file...`);
     const buffer = await file.arrayBuffer();
     const { header, dataOffset, vertexCount } = readPlyHeader(buffer);
     const splats = parseSplatData(buffer, dataOffset, vertexCount);
     statusCallback('loading', `File loaded with ${vertexCount.toLocaleString()} splats.`);
     const originalCount = splats.length;
 
-    // 2. Calculating Scores
-    statusCallback('calculating', 'Calculating elimination scores...');
+    statusCallback('calculating', 'Analyzing splat properties...');
     
-    let minVolume = Infinity;
-    let maxVolume = -Infinity;
+    const opacityThreshold = opacityThresholdPercent / 100;
 
-    // First pass: Calculate intermediate scores and find min/max volume in a single loop
-    // to avoid creating a massive intermediate array for volumes and hitting the call stack limit.
-    const intermediateSplats = splats.map(splat => {
-      // Opacity Score (low opacity -> high score)
-      const realOpacity = 1 / (1 + Math.exp(-splat.opacity));
-      const opacityScore = 1.0 - realOpacity;
+    // FIX: Use reduce to safely find the maximum scale value from a large array
+    const maxScale = splats.reduce((max, s) => {
+        const s0 = Math.exp(s.scale_0);
+        const s1 = Math.exp(s.scale_1);
+        const s2 = Math.exp(s.scale_2);
+        return Math.max(max, s0, s1, s2);
+    }, -Infinity);
+    
+    const scaleThresholdValue = maxScale * (scaleThresholdPercent / 100);
+    
+    statusCallback('reducing', `Reducing splats based on thresholds...`);
 
-      // Size Score (small size -> high score)
-      const realScale0 = Math.exp(splat.scale_0);
-      const realScale1 = Math.exp(splat.scale_1);
-      const realScale2 = Math.exp(splat.scale_2);
-      const volume = realScale0 * realScale1 * realScale2;
+    const keptSplats = splats.filter(splat => {
+        const opacity = sigmoid(splat.opacity);
+        if (opacity < opacityThreshold) {
+            return false;
+        }
 
-      if (volume < minVolume) minVolume = volume;
-      if (volume > maxVolume) maxVolume = volume;
-      
-      return { splat, volume, opacityScore };
+        const scale0 = Math.exp(splat.scale_0);
+        const scale1 = Math.exp(splat.scale_1);
+        const scale2 = Math.exp(splat.scale_2);
+
+        if (scale0 < scaleThresholdValue && scale1 < scaleThresholdValue && scale2 < scaleThresholdValue) {
+            return false;
+        }
+
+        return true;
     });
 
-    const volumeRange = maxVolume - minVolume;
-
-    // Second pass: Calculate final scores using the min/max volume
-    const splatsWithFinalScores = intermediateSplats.map(({ splat, volume, opacityScore }) => {
-        const normalizedVolume = volumeRange > 0 ? (volume - minVolume) / volumeRange : 0;
-        const sizeScore = 1.0 - normalizedVolume;
-        const finalScore = (W_OPACITY * opacityScore) + (W_SIZE * sizeScore);
-        return { splat, finalScore };
-    });
-
-    // 3. Reducing Splats
-    statusCallback('reducing', `Reducing ${percentage}% of the least important splats...`);
-    splatsWithFinalScores.sort((a, b) => b.finalScore - a.finalScore); // Sort descending by score
-
-    const numToRemove = Math.floor(originalCount * (percentage / 100));
-    const keptSplatsData = splatsWithFinalScores.slice(numToRemove);
-    const keptSplats = keptSplatsData.map(s => s.splat); // Extract original splat objects
     const reducedCount = keptSplats.length;
+    statusCallback('saving', `Saving file with ${reducedCount.toLocaleString()} remaining splats...`, {original: originalCount, reduced: reducedCount});
 
-    statusCallback('saving', `Saving ${reducedCount.toLocaleString()} splats remaining...`, {original: originalCount, reduced: reducedCount});
-
-    // 4. Generating Output File
     const newPlyBlob = generatePlyFile(keptSplats, header);
     
-    statusCallback('success', `Process completed successfully! Your download will begin shortly.`, {original: originalCount, reduced: reducedCount});
+    statusCallback('success', `Process complete! The result is now loaded for the next operation.`, {original: originalCount, reduced: reducedCount});
+
+    return newPlyBlob;
+};
+
+export const reduceSplatsInFile = async (
+    file: File | Blob,
+    targetColorHex: string,
+    tolerance: number, // 0-100
+    statusCallback: StatusCallback
+): Promise<Blob> => {
+    statusCallback('loading', `Loading and parsing file...`);
+    const buffer = await file.arrayBuffer();
+    const { header, dataOffset, vertexCount } = readPlyHeader(buffer);
+    const splats = parseSplatData(buffer, dataOffset, vertexCount);
+    statusCallback('loading', `File loaded with ${vertexCount.toLocaleString()} splats.`);
+    const originalCount = splats.length;
+
+    statusCallback('calculating', 'Analyzing splat colors...');
+    const targetRgb = hexToRgb(targetColorHex);
+    const distanceThreshold = (tolerance / 100) * 150;
+
+    statusCallback('reducing', `Deleting splats with the selected color...`);
+
+    const keptSplats = splats.filter(splat => {
+        const splatRgb = shToRgb(splat);
+        const distance = colorDistance(splatRgb, targetRgb);
+        return distance > distanceThreshold;
+    });
+
+    const reducedCount = keptSplats.length;
+
+    statusCallback('saving', `Saving file with ${reducedCount.toLocaleString()} remaining splats...`, {original: originalCount, reduced: reducedCount});
+
+    const newPlyBlob = generatePlyFile(keptSplats, header);
+    
+    statusCallback('success', `Process complete! The result is now loaded for the next operation.`, {original: originalCount, reduced: reducedCount});
 
     return newPlyBlob;
 };

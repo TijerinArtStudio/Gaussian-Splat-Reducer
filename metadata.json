@@ -1,5 +1,5 @@
 {
-  "name": "Gaussian Splat Reducer",
-  "description": "An intelligent tool to reduce the number of splats in a .ply file from Gaussian Splatting, optimizing 3D scenes by removing less important splats based on opacity and size.",
+  "name": "Gaussian Splat Tools",
+  "description": "A suite of tools for processing Gaussian Splatting .ply files. Reduce splat count by opacity/scale or delete splats by color to clean up and optimize your 3D scenes.",
   "requestFramePermissions": []
 }
