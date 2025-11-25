@@ -1,3 +1,4 @@
+
 import type { Splat } from '../types';
 
 type ProcessStatus = 'idle' | 'loading' | 'calculating' | 'reducing' | 'saving' | 'success' | 'error';
@@ -8,246 +9,329 @@ type StatusCallback = (
     counts?: { original: number, reduced: number }
 ) => void;
 
+interface ReductionOptions {
+    mode: 'standard' | 'color';
+    percentage: number;
+    targetColor: string;
+    colorThreshold: number;
+}
+
+const W_OPACITY = 0.7;
+const W_SIZE = 0.3;
+const SH_C0 = 0.28209479177387814;
+
+// Mapping of PLY types to byte sizes
+const TYPE_SIZES: Record<string, number> = {
+    'char': 1, 'uchar': 1, 'int8': 1, 'uint8': 1,
+    'short': 2, 'ushort': 2, 'int16': 2, 'uint16': 2,
+    'int': 4, 'uint': 4, 'int32': 4, 'uint32': 4, 'float': 4, 'float32': 4,
+    'double': 8, 'float64': 8
+};
+
+interface PlyProperty {
+    name: string;
+    type: string;
+    size: number;
+    offset: number;
+}
+
+interface PlyLayout {
+    header: string;
+    headerLength: number;
+    vertexCount: number;
+    rowSize: number; // Bytes per vertex
+    properties: PlyProperty[];
+    dataStart: number;
+}
+
 // --- Helper Functions ---
 
-const readPlyHeader = (buffer: ArrayBuffer): { header: string; dataOffset: number; vertexCount: number } => {
-  const decoder = new TextDecoder();
-  let header = '';
-  let dataOffset = 0;
-  let vertexCount = 0;
-
-  const view = new Uint8Array(buffer);
-  const endHeaderToken = 'end_header\n';
-  let headerEndIndex = -1;
-
-  // Search for end_header, considering the buffer might be large
-  const searchEnd = Math.min(view.length, 4096); // Search in the first 4KB
-  for (let i = 0; i < searchEnd - endHeaderToken.length + 1; i++) {
-    const chunk = decoder.decode(view.slice(i, i + endHeaderToken.length));
-    if (chunk === endHeaderToken) {
-        headerEndIndex = i + endHeaderToken.length;
-        break;
+const parsePlyHeader = (buffer: ArrayBuffer): PlyLayout => {
+    const decoder = new TextDecoder();
+    // Decode enough bytes to likely capture the header
+    const view = new Uint8Array(buffer);
+    // Find the end_header
+    let headerText = '';
+    let headerLength = 0;
+    
+    // Naive search for end_header\n
+    // We scan byte by byte to find the exact end to avoid decoding the huge binary body
+    const endHeaderStr = "end_header";
+    let matchIndex = 0;
+    
+    for (let i = 0; i < Math.min(view.length, 10000); i++) {
+        const byte = view[i];
+        const char = String.fromCharCode(byte);
+        
+        if (char === endHeaderStr[matchIndex]) {
+            matchIndex++;
+            if (matchIndex === endHeaderStr.length) {
+                // Check if next char is newline
+                if (view[i+1] === 10) { // \n
+                    headerLength = i + 2;
+                } else if (view[i+1] === 13 && view[i+2] === 10) { // \r\n
+                    headerLength = i + 3;
+                }
+                if (headerLength > 0) break;
+            }
+        } else {
+            matchIndex = 0;
+            // Retry current char as start if it matches 'e'
+            if (char === 'e') matchIndex = 1; 
+        }
     }
-  }
 
-  if (headerEndIndex === -1) {
-    throw new Error('Could not find "end_header" in the PLY file.');
-  }
-  
-  dataOffset = headerEndIndex;
-  header = decoder.decode(view.slice(0, dataOffset));
-  
-  const match = header.match(/element vertex (\d+)/);
-  if (match) {
-    vertexCount = parseInt(match[1], 10);
-  } else {
-    throw new Error('Could not find vertex count in PLY header.');
-  }
+    if (headerLength === 0) throw new Error("Could not find end_header in PLY.");
 
-  return { header, dataOffset, vertexCount };
-};
+    headerText = decoder.decode(view.slice(0, headerLength));
+    
+    // Parse properties
+    const lines = headerText.split(/\r?\n/);
+    const properties: PlyProperty[] = [];
+    let vertexCount = 0;
+    let currentOffset = 0;
 
-export const getVertexCount = async (file: File | Blob): Promise<number> => {
-    const buffer = await file.arrayBuffer();
-    const { vertexCount } = readPlyHeader(buffer);
-    return vertexCount;
-}
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("element vertex")) {
+            vertexCount = parseInt(trimmed.split(/\s+/)[2], 10);
+        } else if (trimmed.startsWith("property")) {
+            const parts = trimmed.split(/\s+/);
+            // Format: property <type> <name>
+            // or: property list <type> <type> <name> (Not supported for simple Splats, but standard Gaussian Splatting doesn't use lists usually)
+            const type = parts[1];
+            const name = parts[2];
+            const size = TYPE_SIZES[type] || 4; // Default to 4 if unknown, risky but usually float
+            
+            properties.push({
+                name,
+                type,
+                size,
+                offset: currentOffset
+            });
+            currentOffset += size;
+        }
+    }
 
-const parseSplatData = (buffer: ArrayBuffer, dataOffset: number, vertexCount: number): Splat[] => {
-  const dataView = new DataView(buffer, dataOffset);
-  const splats: Splat[] = [];
-  const bytesPerSplat = 14 * 4; // 56 bytes
-  
-  if (dataView.byteLength < vertexCount * bytesPerSplat) {
-      throw new Error(`Buffer is too small for the declared number of vertices. Expected at least ${vertexCount * bytesPerSplat} bytes, but got ${dataView.byteLength}.`);
-  }
-
-  for (let i = 0; i < vertexCount; i++) {
-    const offset = i * bytesPerSplat;
-    const splat: Splat = {
-      x: dataView.getFloat32(offset + 0, true),
-      y: dataView.getFloat32(offset + 4, true),
-      z: dataView.getFloat32(offset + 8, true),
-      f_dc_0: dataView.getFloat32(offset + 12, true),
-      f_dc_1: dataView.getFloat32(offset + 16, true),
-      f_dc_2: dataView.getFloat32(offset + 20, true),
-      opacity: dataView.getFloat32(offset + 24, true),
-      scale_0: dataView.getFloat32(offset + 28, true),
-      scale_1: dataView.getFloat32(offset + 32, true),
-      scale_2: dataView.getFloat32(offset + 36, true),
-      rot_0: dataView.getFloat32(offset + 40, true),
-      rot_1: dataView.getFloat32(offset + 44, true),
-      rot_2: dataView.getFloat32(offset + 48, true),
-      rot_3: dataView.getFloat32(offset + 52, true),
+    return {
+        header: headerText,
+        headerLength,
+        vertexCount,
+        rowSize: currentOffset,
+        properties,
+        dataStart: headerLength
     };
-    splats.push(splat);
-  }
-  return splats;
 };
 
-const generatePlyFile = (splats: Splat[], originalHeader: string): Blob => {
-  const newVertexCount = splats.length;
-  const newHeader = originalHeader.replace(
-    /element vertex \d+/,
-    `element vertex ${newVertexCount}`
-  );
-
-  const bytesPerSplat = 14 * 4;
-  const dataSize = newVertexCount * bytesPerSplat;
-  const buffer = new ArrayBuffer(dataSize);
-  const dataView = new DataView(buffer);
-
-  splats.forEach((splat, i) => {
-    const offset = i * bytesPerSplat;
-    dataView.setFloat32(offset + 0, splat.x, true);
-    dataView.setFloat32(offset + 4, splat.y, true);
-    dataView.setFloat32(offset + 8, splat.z, true);
-    dataView.setFloat32(offset + 12, splat.f_dc_0, true);
-    dataView.setFloat32(offset + 16, splat.f_dc_1, true);
-    dataView.setFloat32(offset + 20, splat.f_dc_2, true);
-    dataView.setFloat32(offset + 24, splat.opacity, true);
-    dataView.setFloat32(offset + 28, splat.scale_0, true);
-    dataView.setFloat32(offset + 32, splat.scale_1, true);
-    dataView.setFloat32(offset + 36, splat.scale_2, true);
-    dataView.setFloat32(offset + 40, splat.rot_0, true);
-    dataView.setFloat32(offset + 44, splat.rot_1, true);
-    dataView.setFloat32(offset + 48, splat.rot_2, true);
-    dataView.setFloat32(offset + 52, splat.rot_3, true);
-  });
-
-  const headerBytes = new TextEncoder().encode(newHeader);
-  return new Blob([headerBytes, buffer], { type: 'application/octet-stream' });
+const getFloatValue = (view: DataView, offset: number, type: string): number => {
+    // We mostly assume standard Gaussian Splats are float32
+    if (type === 'float' || type === 'float32') return view.getFloat32(offset, true);
+    if (type === 'double' || type === 'float64') return view.getFloat64(offset, true);
+    // Handle normalized colors if uchar
+    if (type === 'uchar' || type === 'uint8') return view.getUint8(offset) / 255.0;
+    return 0;
 };
 
-// --- Color Calculation Helpers ---
-
-const hexToRgb = (hex: string): { r: number; g: number; b: number } => {
-  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-  return result
-    ? {
-        r: parseInt(result[1], 16),
-        g: parseInt(result[2], 16),
-        b: parseInt(result[3], 16),
-      }
-    : { r: 0, g: 0, b: 0 };
-};
-
-const SH_C0 = 0.28209479177;
-const shToRgb = (splat: Splat): { r: number; g: number; b: number } => {
-    let r = 0.5 + SH_C0 * splat.f_dc_0;
-    let g = 0.5 + SH_C0 * splat.f_dc_1;
-    let b = 0.5 + SH_C0 * splat.f_dc_2;
-    
-    r = Math.max(0, Math.min(1, r)) * 255;
-    g = Math.max(0, Math.min(1, g)) * 255;
-    b = Math.max(0, Math.min(1, b)) * 255;
-
-    return { r, g, b };
-}
-
-const colorDistance = (
-  color1: { r: number; g: number; b: number },
-  color2: { r: number; g: number; b: number }
-): number => {
-  const dr = color1.r - color2.r;
-  const dg = color1.g - color2.g;
-  const db = color1.b - color2.b;
-  return Math.sqrt(dr * dr + dg * dg + db * db);
-};
-
-
-// --- Main Reducer Logic ---
-
-const sigmoid = (t: number) => 1 / (1 + Math.exp(-t));
-
-export const reduceSplatsByProperties = async (
-    file: File | Blob,
-    opacityThresholdPercent: number, // 0-100
-    scaleThresholdPercent: number, // 0-100
-    statusCallback: StatusCallback
-): Promise<Blob> => {
-    statusCallback('loading', `Loading and parsing file...`);
-    const buffer = await file.arrayBuffer();
-    const { header, dataOffset, vertexCount } = readPlyHeader(buffer);
-    const splats = parseSplatData(buffer, dataOffset, vertexCount);
-    statusCallback('loading', `File loaded with ${vertexCount.toLocaleString()} splats.`);
-    const originalCount = splats.length;
-
-    statusCallback('calculating', 'Analyzing splat properties...');
-    
-    const opacityThreshold = opacityThresholdPercent / 100;
-
-    // FIX: Use reduce to safely find the maximum scale value from a large array
-    const maxScale = splats.reduce((max, s) => {
-        const s0 = Math.exp(s.scale_0);
-        const s1 = Math.exp(s.scale_1);
-        const s2 = Math.exp(s.scale_2);
-        return Math.max(max, s0, s1, s2);
-    }, -Infinity);
-    
-    const scaleThresholdValue = maxScale * (scaleThresholdPercent / 100);
-    
-    statusCallback('reducing', `Reducing splats based on thresholds...`);
-
-    const keptSplats = splats.filter(splat => {
-        const opacity = sigmoid(splat.opacity);
-        if (opacity < opacityThreshold) {
-            return false;
-        }
-
-        const scale0 = Math.exp(splat.scale_0);
-        const scale1 = Math.exp(splat.scale_1);
-        const scale2 = Math.exp(splat.scale_2);
-
-        if (scale0 < scaleThresholdValue && scale1 < scaleThresholdValue && scale2 < scaleThresholdValue) {
-            return false;
-        }
-
-        return true;
-    });
-
-    const reducedCount = keptSplats.length;
-    statusCallback('saving', `Saving file with ${reducedCount.toLocaleString()} remaining splats...`, {original: originalCount, reduced: reducedCount});
-
-    const newPlyBlob = generatePlyFile(keptSplats, header);
-    
-    statusCallback('success', `Process complete! The result is now loaded for the next operation.`, {original: originalCount, reduced: reducedCount});
-
-    return newPlyBlob;
+const hexToRgb = (hex: string): [number, number, number] => {
+    const bigint = parseInt(hex.replace('#', ''), 16);
+    const r = ((bigint >> 16) & 255) / 255;
+    const g = ((bigint >> 8) & 255) / 255;
+    const b = (bigint & 255) / 255;
+    return [r, g, b];
 };
 
 export const reduceSplatsInFile = async (
-    file: File | Blob,
-    targetColorHex: string,
-    tolerance: number, // 0-100
+    file: File, 
+    options: ReductionOptions,
     statusCallback: StatusCallback
 ): Promise<Blob> => {
-    statusCallback('loading', `Loading and parsing file...`);
+    statusCallback('loading', `Reading file structure...`);
     const buffer = await file.arrayBuffer();
-    const { header, dataOffset, vertexCount } = readPlyHeader(buffer);
-    const splats = parseSplatData(buffer, dataOffset, vertexCount);
-    statusCallback('loading', `File loaded with ${vertexCount.toLocaleString()} splats.`);
-    const originalCount = splats.length;
-
-    statusCallback('calculating', 'Analyzing splat colors...');
-    const targetRgb = hexToRgb(targetColorHex);
-    const distanceThreshold = (tolerance / 100) * 150;
-
-    statusCallback('reducing', `Deleting splats with the selected color...`);
-
-    const keptSplats = splats.filter(splat => {
-        const splatRgb = shToRgb(splat);
-        const distance = colorDistance(splatRgb, targetRgb);
-        return distance > distanceThreshold;
-    });
-
-    const reducedCount = keptSplats.length;
-
-    statusCallback('saving', `Saving file with ${reducedCount.toLocaleString()} remaining splats...`, {original: originalCount, reduced: reducedCount});
-
-    const newPlyBlob = generatePlyFile(keptSplats, header);
     
-    statusCallback('success', `Process complete! The result is now loaded for the next operation.`, {original: originalCount, reduced: reducedCount});
+    let layout: PlyLayout;
+    try {
+        layout = parsePlyHeader(buffer);
+    } catch (e) {
+        console.error(e);
+        throw new Error("Failed to parse PLY header. Is this a valid binary PLY?");
+    }
 
-    return newPlyBlob;
+    statusCallback('loading', `Found ${layout.vertexCount.toLocaleString()} splats. Row size: ${layout.rowSize} bytes.`);
+
+    // Find critical property offsets
+    const propMap = new Map<string, PlyProperty>();
+    layout.properties.forEach(p => propMap.set(p.name, p));
+
+    const getProp = (keys: string[]) => {
+        for (const k of keys) {
+            if (propMap.has(k)) return propMap.get(k);
+        }
+        return null;
+    };
+
+    const pOpacity = getProp(['opacity', 'alpha']);
+    const pScale0 = getProp(['scale_0', 'scale0']);
+    const pScale1 = getProp(['scale_1', 'scale1']);
+    const pScale2 = getProp(['scale_2', 'scale2']);
+    
+    // For Color mode
+    const pFdc0 = getProp(['f_dc_0', 'f_dc0', 'red']);
+    const pFdc1 = getProp(['f_dc_1', 'f_dc1', 'green']);
+    const pFdc2 = getProp(['f_dc_2', 'f_dc2', 'blue']);
+
+    if (!pOpacity || !pScale0) {
+        throw new Error("Could not find opacity or scale properties in PLY.");
+    }
+
+    // --- Analysis Pass ---
+    statusCallback('calculating', 'Analyzing splats...');
+    
+    const dataView = new DataView(buffer, layout.dataStart);
+    const indicesToKeep: number[] = [];
+    const items = [];
+
+    // Helper to calculate SH to Color
+    // RGB = 0.5 + C0 * f_dc
+    const shToColor = (val: number) => 0.5 + (SH_C0 * val);
+
+    let minVolume = Infinity;
+    let maxVolume = -Infinity;
+
+    // Optimization: Loop once to gather data for sorting or filtering
+    for (let i = 0; i < layout.vertexCount; i++) {
+        const base = i * layout.rowSize;
+        
+        // Read Opacity (usually logit)
+        const opacityRaw = getFloatValue(dataView, base + pOpacity.offset, pOpacity.type);
+        const opacity = 1 / (1 + Math.exp(-opacityRaw)); // Sigmoid
+
+        // Read Scale (usually log)
+        const s0 = getFloatValue(dataView, base + pScale0.offset, pScale0.type);
+        const s1 = getFloatValue(dataView, base + pScale1!.offset, pScale1!.type);
+        const s2 = getFloatValue(dataView, base + pScale2!.offset, pScale2!.type);
+        const vol = Math.exp(s0) * Math.exp(s1) * Math.exp(s2);
+
+        if (vol < minVolume) minVolume = vol;
+        if (vol > maxVolume) maxVolume = vol;
+
+        // Read Color if needed
+        let r=0, g=0, b=0;
+        if (options.mode === 'color' && pFdc0 && pFdc1 && pFdc2) {
+             const f0 = getFloatValue(dataView, base + pFdc0.offset, pFdc0.type);
+             const f1 = getFloatValue(dataView, base + pFdc1.offset, pFdc1.type);
+             const f2 = getFloatValue(dataView, base + pFdc2.offset, pFdc2.type);
+             
+             // If property name implies simple color (red/green/blue), usually 0-1 or 0-255. 
+             // But Gaussian Splats use Spherical Harmonics (f_dc).
+             // We assume standard 3DGS SH if names are f_dc_*.
+             if (pFdc0.name.startsWith('f_dc')) {
+                 r = shToColor(f0);
+                 g = shToColor(f1);
+                 b = shToColor(f2);
+             } else {
+                 // Fallback for direct color properties
+                 r = f0; g = f1; b = f2;
+             }
+        }
+
+        items.push({
+            index: i,
+            opacity,
+            vol,
+            r, g, b
+        });
+    }
+
+    // --- Reduction Logic ---
+    
+    if (options.mode === 'standard') {
+        const volRange = maxVolume - minVolume;
+        
+        // Calculate scores
+        const scoredItems = items.map(item => {
+            const opacityScore = 1.0 - item.opacity; // Lower opacity = Higher score (candidate for removal) ??
+            // Wait, logic: We want to REMOVE low importance.
+            // Importance = Opacity * Size.
+            // Actually, usually we remove transparent and small things.
+            // So Score should be "Importance". Keep High Score.
+            // Opacity: 0 (invisible) -> 1 (solid).
+            // Volume: Small -> Big.
+            
+            // Normalized inputs 0..1
+            const normVol = volRange > 0 ? (item.vol - minVolume) / volRange : 0;
+            
+            // Score: Higher means MORE IMPORTANT (Keep)
+            // Let's invert the previous logic to be clearer.
+            // We want to keep Solid (opacity 1) and Big (vol 1).
+            const score = (W_OPACITY * item.opacity) + (W_SIZE * normVol);
+            
+            return { index: item.index, score };
+        });
+
+        statusCallback('reducing', `Smart Removing bottom ${options.percentage}%...`);
+        
+        // Sort Ascending (Smallest score first)
+        scoredItems.sort((a, b) => a.score - b.score);
+        
+        const removeCount = Math.floor(layout.vertexCount * (options.percentage / 100));
+        // Keep from removeCount to end
+        for (let i = removeCount; i < scoredItems.length; i++) {
+            indicesToKeep.push(scoredItems[i].index);
+        }
+
+    } else {
+        // Color Mode
+        const targetRgb = hexToRgb(options.targetColor);
+        const maxDist = 0.8; // Approximate max euclidean dist in RGB space roughly
+        const thresholdDist = (options.colorThreshold / 100) * maxDist;
+
+        statusCallback('reducing', `Filtering by color...`);
+        
+        items.forEach(item => {
+            const dist = Math.sqrt(
+                Math.pow(item.r - targetRgb[0], 2) +
+                Math.pow(item.g - targetRgb[1], 2) +
+                Math.pow(item.b - targetRgb[2], 2)
+            );
+            
+            // If distance is LESS than threshold, it matches the target color -> REMOVE IT.
+            // So we KEEP if dist > threshold
+            if (dist > thresholdDist) {
+                indicesToKeep.push(item.index);
+            }
+        });
+    }
+
+    const reducedCount = indicesToKeep.length;
+    statusCallback('saving', `Generating new PLY with ${reducedCount.toLocaleString()} splats...`, { original: layout.vertexCount, reduced: reducedCount });
+
+    // --- Reconstruction ---
+    // 1. Create New Header
+    // We just replace the vertex count in the original header text
+    let newHeaderText = layout.header.replace(
+        /element vertex \d+/, 
+        `element vertex ${reducedCount}`
+    );
+    // Ensure clean newlines
+    newHeaderText = newHeaderText.trim() + '\n';
+    
+    const encoder = new TextEncoder();
+    const newHeaderBytes = encoder.encode(newHeaderText);
+    
+    // 2. Build Data Buffer
+    const newBuffer = new Uint8Array(reducedCount * layout.rowSize);
+    const sourceBytes = new Uint8Array(buffer, layout.dataStart);
+
+    // Copy rows
+    for (let i = 0; i < reducedCount; i++) {
+        const originalIndex = indicesToKeep[i];
+        const srcStart = originalIndex * layout.rowSize;
+        const srcEnd = srcStart + layout.rowSize;
+        const destStart = i * layout.rowSize;
+        
+        // Fast copy using TypedArray set (sub-array view)
+        newBuffer.set(sourceBytes.subarray(srcStart, srcEnd), destStart);
+    }
+
+    return new Blob([newHeaderBytes, newBuffer], { type: 'application/octet-stream' });
 };

@@ -1,50 +1,46 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { UploadIcon } from './Icons';
-import { Button } from './Button';
 
 interface FileInputProps {
-  onFileSelect: (file: File) => void;
-  onClear: () => void;
-  fileName: string | null;
+  onFileSelect: (file: File | null) => void;
   disabled?: boolean;
 }
 
-export const FileInput: React.FC<FileInputProps> = ({ onFileSelect, onClear, fileName, disabled }) => {
+export const FileInput: React.FC<FileInputProps> = ({ onFileSelect, disabled }) => {
+  const [fileName, setFileName] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = useCallback((file: File | null) => {
     if (file && file.name.toLowerCase().endsWith('.ply')) {
+      setFileName(file.name);
       onFileSelect(file);
     } else {
-      // Simple alert for now, could be a more elegant notification
-      alert('Invalid file type. Please select a .ply file.');
+      setFileName('Invalid file type. Please select a .ply file.');
+      onFileSelect(null);
     }
   }, [onFileSelect]);
 
-  const handleDragEnter = (e: React.DragEvent<HTMLElement>) => {
+  const handleDragEnter = (e: React.DragEvent<HTMLLabelElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    if (disabled) return;
     setIsDragging(true);
   };
 
-  const handleDragLeave = (e: React.DragEvent<HTMLElement>) => {
+  const handleDragLeave = (e: React.DragEvent<HTMLLabelElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    if (disabled) return;
     setIsDragging(false);
   };
 
-  const handleDragOver = (e: React.DragEvent<HTMLElement>) => {
+  const handleDragOver = (e: React.DragEvent<HTMLLabelElement>) => {
     e.preventDefault();
     e.stopPropagation();
   };
 
-  const handleDrop = (e: React.DragEvent<HTMLElement>) => {
+  const handleDrop = (e: React.DragEvent<HTMLLabelElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    if (disabled) return;
     setIsDragging(false);
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       handleFile(e.dataTransfer.files[0]);
@@ -56,20 +52,6 @@ export const FileInput: React.FC<FileInputProps> = ({ onFileSelect, onClear, fil
       handleFile(e.target.files[0]);
     }
   };
-
-  if (fileName) {
-    return (
-      <div className="flex flex-col sm:flex-row items-center justify-between w-full h-auto sm:h-20 px-4 py-3 bg-gray-900 rounded-lg border border-gray-600">
-        <div className="text-center sm:text-left mb-3 sm:mb-0">
-          <p className="text-sm text-gray-400">Current File:</p>
-          <p className="font-semibold text-gray-200 truncate" title={fileName}>{fileName}</p>
-        </div>
-        <Button onClick={onClear} disabled={disabled} >
-            Start Over
-        </Button>
-      </div>
-    );
-  }
 
   return (
     <div>
@@ -85,10 +67,16 @@ export const FileInput: React.FC<FileInputProps> = ({ onFileSelect, onClear, fil
       >
         <div className="flex flex-col items-center justify-center pt-5 pb-6 text-center">
           <UploadIcon className="w-8 h-8 mb-2 text-gray-400"/>
-          <p className="mb-2 text-sm text-gray-400">
-            <span className="font-semibold text-cyan-400">Click to upload</span> or drag and drop
-          </p>
-          <p className="text-xs text-gray-500">Gaussian Splatting .PLY file</p>
+          {fileName ? (
+             <p className="font-semibold text-gray-300">{fileName}</p>
+          ) : (
+            <>
+              <p className="mb-2 text-sm text-gray-400">
+                <span className="font-semibold text-cyan-400">Click to upload</span> or drag and drop
+              </p>
+              <p className="text-xs text-gray-500">Gaussian Splatting .PLY file</p>
+            </>
+          )}
         </div>
         <input ref={fileInputRef} id="file-upload" type="file" className="hidden" onChange={handleChange} accept=".ply" disabled={disabled} />
       </label>

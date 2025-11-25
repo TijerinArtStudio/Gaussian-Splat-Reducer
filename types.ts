@@ -1,3 +1,4 @@
+
 export interface Splat {
   // Position
   x: number;
