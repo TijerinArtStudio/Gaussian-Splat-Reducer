@@ -54,6 +54,7 @@ export const PlyViewer: React.FC<PlyViewerProps> = ({ title, fileBuffer }) => {
             alpha: false,
             powerPreference: 'high-performance'
         });
+        
         // Pass false as third argument to prevent style modification which causes ResizeObserver loops
         renderer.setSize(width, height, false);
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Limit pixel ratio for perf
@@ -90,13 +91,15 @@ export const PlyViewer: React.FC<PlyViewerProps> = ({ title, fileBuffer }) => {
         // 6. Handle Window Resize
         const onResize = () => {
             // Wrap in requestAnimationFrame to avoid "ResizeObserver loop completed with undelivered notifications"
-            requestAnimationFrame(() => {
+            // This decouples the sizing from the observation callback loop
+            window.requestAnimationFrame(() => {
                 if (!mounted || !containerRef.current || !camera || !renderer) return;
                 const w = containerRef.current.clientWidth;
                 const h = containerRef.current.clientHeight;
                 camera.aspect = w / h;
                 camera.updateProjectionMatrix();
-                // Update internal resolution only, do not touch CSS styles
+                
+                // IMPORTANT: updateStyle = false to prevent touching DOM styles
                 renderer.setSize(w, h, false);
             });
         };

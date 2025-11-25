@@ -13,9 +13,9 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({ color, onChange, toleran
   const [isDragging, setIsDragging] = useState(false);
   const [selectorPos, setSelectorPos] = useState<{x: number, y: number} | null>(null);
 
-  const CANVAS_SIZE = 220;
+  const DISPLAY_SIZE = 220;
 
-  // Draw scene function using logical coordinates (0 to CANVAS_SIZE)
+  // Draw scene function using logical coordinates (0 to DISPLAY_SIZE)
   const drawScene = (
       ctx: CanvasRenderingContext2D, 
       width: number, 
@@ -26,11 +26,9 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({ color, onChange, toleran
     const centerY = height / 2;
     const radius = Math.min(width, height) / 2 - 10;
 
-    // Reset transform to clear full buffer
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-    ctx.restore();
+    // Clear the canvas using the full transformed space
+    // Since we used scale(dpr, dpr), clearing 0,0,width,height works in logical coords
+    ctx.clearRect(0, 0, width, height);
 
     // 1. Draw Hue Ring
     for (let i = 0; i < 360; i+=2) {
@@ -89,12 +87,14 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({ color, onChange, toleran
 
     // High DPI Setup
     const dpr = window.devicePixelRatio || 1;
+    
     // Set internal size to physical pixels
-    canvas.width = CANVAS_SIZE * dpr;
-    canvas.height = CANVAS_SIZE * dpr;
-    // Set display size to logical pixels
-    canvas.style.width = `${CANVAS_SIZE}px`;
-    canvas.style.height = `${CANVAS_SIZE}px`;
+    canvas.width = DISPLAY_SIZE * dpr;
+    canvas.height = DISPLAY_SIZE * dpr;
+    
+    // Set display size to logical pixels via CSS
+    canvas.style.width = `${DISPLAY_SIZE}px`;
+    canvas.style.height = `${DISPLAY_SIZE}px`;
 
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
@@ -102,7 +102,7 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({ color, onChange, toleran
     // Scale context so drawing operations use logical pixels
     ctx.scale(dpr, dpr);
     
-    drawScene(ctx, CANVAS_SIZE, CANVAS_SIZE, selectorPos);
+    drawScene(ctx, DISPLAY_SIZE, DISPLAY_SIZE, selectorPos);
   }, [tolerance, selectorPos]);
 
   const handleInteraction = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
@@ -128,9 +128,9 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({ color, onChange, toleran
     const x = clientX - rect.left;
     const y = clientY - rect.top;
 
-    const centerX = CANVAS_SIZE / 2;
-    const centerY = CANVAS_SIZE / 2;
-    const radius = CANVAS_SIZE / 2 - 10;
+    const centerX = DISPLAY_SIZE / 2;
+    const centerY = DISPLAY_SIZE / 2;
+    const radius = DISPLAY_SIZE / 2 - 10;
     const dist = Math.sqrt(Math.pow(x - centerX, 2) + Math.pow(y - centerY, 2));
     
     if (dist > radius + 5) return; 
@@ -138,14 +138,11 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({ color, onChange, toleran
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
     
-    // To pick the color, we need to know the color at (x, y). 
-    // Since the context is scaled, we need to multiply by DPR to get the physical pixel data.
-    // However, it's easier to redraw the pure color wheel (without selectors) and read that.
-    
-    // Temporarily redraw clean scene
-    drawScene(ctx, CANVAS_SIZE, CANVAS_SIZE, null);
+    // Temporarily redraw clean scene to sample color
+    drawScene(ctx, DISPLAY_SIZE, DISPLAY_SIZE, null);
     
     const dpr = window.devicePixelRatio || 1;
+    // getImageData uses physical pixels
     const pixel = ctx.getImageData(x * dpr, y * dpr, 1, 1).data;
     const toHex = (n: number) => n.toString(16).padStart(2, '0');
     const hex = `#${toHex(pixel[0])}${toHex(pixel[1])}${toHex(pixel[2])}`;
@@ -154,14 +151,13 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({ color, onChange, toleran
     onChange(hex);
     
     // Redraw with selector
-    drawScene(ctx, CANVAS_SIZE, CANVAS_SIZE, { x, y });
+    drawScene(ctx, DISPLAY_SIZE, DISPLAY_SIZE, { x, y });
   };
 
   return (
     <div className="flex flex-col items-center space-y-3">
         <canvas 
             ref={canvasRef}
-            // Width and Height are set in useEffect for High DPI
             className={`rounded-full cursor-crosshair shadow-2xl border-4 border-gray-800 bg-gray-900 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}
             onMouseDown={handleInteraction}
             onMouseMove={handleInteraction}
