@@ -8,11 +8,10 @@ import { Header } from './components/Header';
 import { StatsCard } from './components/StatsCard';
 import { PlyViewer } from './components/PlyViewer';
 import { reduceSplatsInFile } from './services/plyReducer';
-import { SparklesIcon, DownloadIcon, ArrowPathIcon } from './components/Icons';
+import { SparklesIcon, DownloadIcon, ArrowPathIcon, EyedropperIcon } from './components/Icons';
 import { ColorWheel } from './components/ColorWheel';
 
 type ProcessStatus = 'idle' | 'loading' | 'calculating' | 'reducing' | 'saving' | 'success' | 'error';
-type ReductionMode = 'standard' | 'color';
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
@@ -25,10 +24,10 @@ export default function App() {
   const [reducedKey, setReducedKey] = useState<number>(0);
   
   // Settings
-  const [mode, setMode] = useState<ReductionMode>('standard');
-  const [percentage, setPercentage] = useState<number>(30);
+  const [opacityRemoval, setOpacityRemoval] = useState<number>(10);
+  const [sizeRemoval, setSizeRemoval] = useState<number>(10);
   const [targetColor, setTargetColor] = useState<string>("#ffffff");
-  const [colorThreshold, setColorThreshold] = useState<number>(20);
+  const [colorThreshold, setColorThreshold] = useState<number>(0); // Default 0 means disabled
 
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [status, setStatus] = useState<ProcessStatus>('idle');
@@ -78,6 +77,22 @@ export default function App() {
       setReducedKey(prev => prev + 1);
   };
 
+  const handleEyeDropper = async () => {
+    if ('EyeDropper' in window) {
+      try {
+        // @ts-ignore - EyeDropper API is not yet in all TS definitions
+        const eyeDropper = new window.EyeDropper();
+        const result = await eyeDropper.open();
+        setTargetColor(result.sRGBHex);
+        if (colorThreshold === 0) setColorThreshold(10); // Auto-enable if it was off
+      } catch (e) {
+        console.log("EyeDropper closed", e);
+      }
+    } else {
+      alert("Your browser does not support the Eyedropper tool. Please use the color wheel manually.");
+    }
+  };
+
   const handleReduce = async () => {
     if (!file) {
       setStatus('error');
@@ -86,7 +101,6 @@ export default function App() {
     }
 
     setIsProcessing(true);
-    // Do not clear the original viewer
     setReducedFileBuffer(null);
     setReducedBlob(null);
     
@@ -103,8 +117,8 @@ export default function App() {
 
     try {
       const options = {
-        mode,
-        percentage,
+        opacityRemoval,
+        sizeRemoval,
         targetColor,
         colorThreshold
       };
@@ -115,7 +129,7 @@ export default function App() {
           const buffer = await resultBlob.arrayBuffer();
           setReducedFileBuffer(buffer);
           setReducedBlob(resultBlob);
-          setReducedKey(prev => prev + 1); // Force mount of reduced viewer
+          setReducedKey(prev => prev + 1);
           statusCallback('success', 'Reduction complete! Ready to download.');
       } catch (e) {
           statusCallback('error', 'Could not display the reduced file preview.');
@@ -135,9 +149,8 @@ export default function App() {
       const url = URL.createObjectURL(reducedBlob);
       const a = document.createElement('a');
       a.href = url;
-      const modeSuffix = mode === 'standard' ? `_${percentage}p` : `_color`;
       const originalName = file.name.replace(/\.ply$/i, '');
-      a.download = `${originalName}_reduced${modeSuffix}.ply`;
+      a.download = `${originalName}_reduced.ply`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -154,76 +167,100 @@ export default function App() {
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
             
             {/* Left Column: Controls (4 columns) */}
-            <div className="lg:col-span-4 space-y-8 flex flex-col h-full">
-                <div className="space-y-4">
-                  <h2 className="text-xl font-semibold text-cyan-400">1. Upload File</h2>
+            <div className="lg:col-span-4 space-y-6 flex flex-col h-full">
+                
+                {/* 1. Upload */}
+                <div className="space-y-3">
+                  <h2 className="text-lg font-semibold text-cyan-400">1. Upload File</h2>
                   <FileInput onFileSelect={handleFileChange} disabled={isProcessing} />
                 </div>
 
+                {/* 2. Reduction Settings */}
                 <div className="space-y-4">
-                  <h2 className="text-xl font-semibold text-cyan-400">2. Reduction Settings</h2>
+                  <h2 className="text-lg font-semibold text-cyan-400">2. Reduction Settings</h2>
                   
-                  {/* Mode Toggles */}
-                  <div className="flex p-1 bg-gray-900 rounded-lg">
-                      <button 
-                        onClick={() => setMode('standard')}
-                        disabled={isProcessing}
-                        className={`flex-1 py-2 text-sm font-medium rounded-md transition-colors ${mode === 'standard' ? 'bg-cyan-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}
-                      >
-                        Smart Reduce
-                      </button>
-                      <button 
-                        onClick={() => setMode('color')}
-                        disabled={isProcessing}
-                        className={`flex-1 py-2 text-sm font-medium rounded-md transition-colors ${mode === 'color' ? 'bg-cyan-600 text-white shadow' : 'text-gray-400 hover:text-white'}`}
-                      >
-                        Color Filter
-                      </button>
+                  {/* Smart Reduce Section */}
+                  <div className="bg-gray-900/50 p-4 rounded-lg border border-gray-700 space-y-5">
+                      <div className="flex items-center space-x-2">
+                        <SparklesIcon className="w-4 h-4 text-cyan-400" />
+                        <span className="text-sm font-bold text-gray-200">Smart Reduce</span>
+                      </div>
+                      
+                      {/* Opacity Slider */}
+                      <div className="space-y-1">
+                          <div className="flex justify-between items-center text-xs">
+                              <span className="text-gray-300">Remove Transparent</span>
+                              <span className="text-cyan-400 font-mono">{opacityRemoval}%</span>
+                          </div>
+                          <Slider
+                              value={opacityRemoval}
+                              onChange={setOpacityRemoval}
+                              disabled={isProcessing}
+                          />
+                          <p className="text-[10px] text-gray-500">Removes the most transparent splats.</p>
+                      </div>
+
+                      {/* Size Slider */}
+                      <div className="space-y-1">
+                          <div className="flex justify-between items-center text-xs">
+                              <span className="text-gray-300">Remove Smallest</span>
+                              <span className="text-cyan-400 font-mono">{sizeRemoval}%</span>
+                          </div>
+                          <Slider
+                              value={sizeRemoval}
+                              onChange={setSizeRemoval}
+                              disabled={isProcessing}
+                          />
+                          <p className="text-[10px] text-gray-500">Removes the tiniest splats.</p>
+                      </div>
                   </div>
 
-                  {mode === 'standard' ? (
-                    <div className="bg-gray-900/50 p-4 rounded-lg border border-gray-700 space-y-4">
-                        <div className="flex justify-between items-center text-sm">
-                            <span className="text-gray-300">Reduction Percentage</span>
+                  {/* Color Filter Section */}
+                  <div className="bg-gray-900/50 p-4 rounded-lg border border-gray-700 space-y-4">
+                      <div className="flex justify-between items-start">
+                        <div className="space-y-1">
+                           <span className="text-sm font-bold text-gray-200 block">Color Filter</span>
+                           <p className="text-[10px] text-gray-500">Remove specific colors.</p>
                         </div>
-                        <Slider
-                            value={percentage}
-                            onChange={setPercentage}
+                        <button 
+                            onClick={handleEyeDropper}
                             disabled={isProcessing}
-                        />
-                        <p className="text-xs text-gray-500">
-                            Higher % = smaller file size, lower quality.
-                        </p>
-                    </div>
-                  ) : (
-                    <div className="bg-gray-900/50 p-4 rounded-lg border border-gray-700 space-y-6">
-                        <div className="flex flex-col items-center space-y-2">
-                            <label className="text-sm font-medium text-gray-300">Target Color to Remove</label>
-                            <ColorWheel 
-                                color={targetColor}
-                                onChange={setTargetColor}
-                                tolerance={colorThreshold}
-                                disabled={isProcessing}
-                            />
-                        </div>
+                            className="p-2 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded-md text-cyan-400 transition-colors"
+                            title="Pick color from screen"
+                        >
+                            <EyedropperIcon className="w-4 h-4" />
+                        </button>
+                      </div>
 
-                        <div className="space-y-2">
-                            <label className="text-sm text-gray-300">Tolerance Range ({colorThreshold}%)</label>
-                            <Slider
-                                value={colorThreshold}
-                                onChange={setColorThreshold}
-                                disabled={isProcessing}
-                            />
-                            <p className="text-xs text-center text-gray-500">
-                                Adjust circle size to include more shades.
-                            </p>
-                        </div>
-                    </div>
-                  )}
+                      <div className="flex flex-col items-center">
+                          <ColorWheel 
+                              color={targetColor}
+                              onChange={setTargetColor}
+                              tolerance={colorThreshold}
+                              disabled={isProcessing}
+                          />
+                      </div>
+
+                      <div className="space-y-1">
+                          <div className="flex justify-between items-center text-xs">
+                              <span className="text-gray-300">Tolerance</span>
+                              <span className="text-cyan-400 font-mono">{colorThreshold}%</span>
+                          </div>
+                          <Slider
+                              value={colorThreshold}
+                              onChange={setColorThreshold}
+                              disabled={isProcessing}
+                          />
+                          <p className="text-[10px] text-gray-500 text-center">
+                              {colorThreshold === 0 ? "Filter Disabled" : "Increase to remove more shades"}
+                          </p>
+                      </div>
+                  </div>
                 </div>
 
-                <div className="space-y-4">
-                   <h2 className="text-xl font-semibold text-cyan-400">3. Status</h2>
+                {/* 3. Status */}
+                <div className="space-y-3">
+                   <h2 className="text-lg font-semibold text-cyan-400">3. Status</h2>
                    <StatusDisplay status={status} message={statusMessage} />
                    {(originalCount !== null || reducedCount !== null) && (
                        <div className="grid grid-cols-2 gap-2 mt-2">
@@ -234,13 +271,13 @@ export default function App() {
                 </div>
                 
                 {/* Action Buttons Row */}
-                <div className="pt-4 mt-auto grid grid-cols-3 gap-2">
+                <div className="pt-2 mt-auto grid grid-cols-3 gap-2">
                   <Button
                     onClick={handleReduce}
                     disabled={!file || isProcessing}
                     className="w-full px-2"
                     variant="primary"
-                    title="Preview Reduction"
+                    title="Start Reduction"
                   >
                     <SparklesIcon className="w-5 h-5" />
                   </Button>
@@ -271,27 +308,27 @@ export default function App() {
             <div className="lg:col-span-8 flex flex-col gap-6">
                
                {/* Original Viewer */}
-               <div className="flex-1 min-h-[400px] flex flex-col">
-                 <h2 className="text-lg font-semibold text-gray-300 mb-2">Original Scene</h2>
+               <div className="flex-1 min-h-[350px] flex flex-col">
+                 <h2 className="text-md font-semibold text-gray-400 mb-2">Original Scene</h2>
                  <div className="flex-1 bg-black rounded-xl overflow-hidden shadow-inner border border-gray-700 relative">
                     <PlyViewer key={`orig-${originalKey}`} fileBuffer={originalFileBuffer} />
                  </div>
                </div>
 
-               {/* Reduced Viewer (Only visible if processing done) */}
-               <div className="flex-1 min-h-[400px] flex flex-col">
-                  <h2 className="text-lg font-semibold text-cyan-400 mb-2">
-                      Reduced Scene {reducedCount ? `(${Math.round((reducedCount/ (originalCount || 1)) * 100)}% splats)` : '(Preview)'}
+               {/* Reduced Viewer */}
+               <div className="flex-1 min-h-[350px] flex flex-col">
+                  <h2 className="text-md font-semibold text-cyan-400 mb-2">
+                      Reduced Scene {reducedCount ? `(${Math.round((reducedCount/ (originalCount || 1)) * 100)}% splats remaining)` : '(Preview)'}
                   </h2>
                   <div className="flex-1 bg-black rounded-xl overflow-hidden shadow-inner border border-gray-700 relative">
                      {reducedFileBuffer ? (
                          <PlyViewer key={`red-${reducedKey}`} fileBuffer={reducedFileBuffer} />
                      ) : (
-                         <div className="w-full h-full flex items-center justify-center text-gray-500">
+                         <div className="w-full h-full flex items-center justify-center text-gray-500 bg-gray-900/20">
                              {isProcessing ? (
                                  <span className="animate-pulse">Processing...</span>
                              ) : (
-                                 <span>Result will appear here after reduction</span>
+                                 <span>Result will appear here</span>
                              )}
                          </div>
                      )}
