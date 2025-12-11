@@ -1,5 +1,5 @@
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import { FileInput } from './components/FileInput';
 import { Button } from './components/Button';
 import { Slider } from './components/Slider';
@@ -7,7 +7,7 @@ import { StatusDisplay } from './components/StatusDisplay';
 import { Header } from './components/Header';
 import { StatsCard } from './components/StatsCard';
 import { PlyViewer } from './components/PlyViewer';
-import { reduceSplatsInFile } from './services/plyReducer';
+import { reduceSplatsInFile, analyzeFile } from './services/plyReducer';
 import { SparklesIcon, DownloadIcon, ArrowPathIcon, EyedropperIcon } from './components/Icons';
 import { ColorWheel } from './components/ColorWheel';
 
@@ -15,9 +15,22 @@ type ProcessStatus = 'idle' | 'loading' | 'calculating' | 'reducing' | 'saving' 
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
+  
+  // Buffers
   const [originalFileBuffer, setOriginalFileBuffer] = useState<ArrayBuffer | null>(null);
-  const [reducedFileBuffer, setReducedFileBuffer] = useState<ArrayBuffer | null>(null);
+  // resultViewBuffer controls what shows in the "Optimized Result" window.
+  // Initially = Original Buffer. After processing = Reduced Buffer.
+  const [resultViewBuffer, setResultViewBuffer] = useState<ArrayBuffer | null>(null);
+  
   const [reducedBlob, setReducedBlob] = useState<Blob | null>(null);
+  
+  // Data Analysis for Percentiles
+  const [analysisData, setAnalysisData] = useState<{ opacities: Float32Array, volumes: Float32Array } | null>(null);
+
+  // Logger (console only now)
+  const addLog = useCallback((msg: string) => {
+      console.log(`[App] ${msg}`);
+  }, []);
   
   // Keys to force remounts
   const [originalKey, setOriginalKey] = useState<number>(0);
@@ -29,30 +42,85 @@ export default function App() {
   const [targetColor, setTargetColor] = useState<string>("#ffffff");
   const [colorThreshold, setColorThreshold] = useState<number>(0); // Default 0 means disabled
 
+  // State for manually protected splats (indices)
+  const [protectedIndices, setProtectedIndices] = useState<Set<number>>(new Set());
+
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [status, setStatus] = useState<ProcessStatus>('idle');
   const [statusMessage, setStatusMessage] = useState<string>('Upload a .ply file to get started.');
   const [originalCount, setOriginalCount] = useState<number | null>(null);
   const [reducedCount, setReducedCount] = useState<number | null>(null);
 
+  // Calculate ACTUAL thresholds based on distribution to send to the Live Viewer
+  const reductionSettings = useMemo(() => {
+    let opacityThreshold = -1.0; // Default matches nothing
+    let sizeThreshold = -1.0;
+
+    if (analysisData) {
+        if (opacityRemoval > 0) {
+            const idx = Math.floor(analysisData.opacities.length * (opacityRemoval / 100));
+            // Clamp index
+            const safeIdx = Math.min(Math.max(idx, 0), analysisData.opacities.length - 1);
+            opacityThreshold = analysisData.opacities[safeIdx];
+        }
+        if (sizeRemoval > 0) {
+            const idx = Math.floor(analysisData.volumes.length * (sizeRemoval / 100));
+            const safeIdx = Math.min(Math.max(idx, 0), analysisData.volumes.length - 1);
+            sizeThreshold = analysisData.volumes[safeIdx];
+        }
+    }
+
+    return {
+        opacityThreshold,
+        sizeThreshold,
+        targetColor,
+        colorThreshold
+    };
+  }, [opacityRemoval, sizeRemoval, targetColor, colorThreshold, analysisData]);
+
   const handleFileChange = useCallback(async (selectedFile: File | null) => {
     setFile(selectedFile);
-    setReducedFileBuffer(null);
+    // Reset buffers
+    setOriginalFileBuffer(null);
+    setResultViewBuffer(null);
     setReducedBlob(null);
+    setAnalysisData(null);
+    
     setOriginalCount(null);
     setReducedCount(null);
-    setOriginalFileBuffer(null);
+    setProtectedIndices(new Set()); // Reset protections on new file
     setOriginalKey(prev => prev + 1);
 
     if (selectedFile) {
+      addLog(`File selected: ${selectedFile.name} (${(selectedFile.size / 1024 / 1024).toFixed(2)} MB)`);
       setStatus('idle');
-      setStatusMessage(`Selected file: ${selectedFile.name}. Ready to process.`);
+      setStatusMessage(`Selected file: ${selectedFile.name}. Loading...`);
       try {
         const buffer = await selectedFile.arrayBuffer();
+        addLog(`File loaded into buffer. Bytes: ${buffer.byteLength}`);
+        
+        // Show original immediately in both views
         setOriginalFileBuffer(buffer);
+        setResultViewBuffer(buffer); 
+        
         setOriginalKey(prev => prev + 1);
+        setReducedKey(prev => prev + 1);
+        setStatusMessage(`Analyzing file statistics...`);
+
+        // Trigger Analysis
+        analyzeFile(selectedFile).then(data => {
+            setAnalysisData(data);
+            setOriginalCount(data.opacities.length);
+            setStatusMessage(`Ready. Found ${data.opacities.length.toLocaleString()} splats.`);
+            addLog(`Analysis complete. Opacity/Volume data available.`);
+        }).catch(e => {
+            console.error(e);
+            setStatusMessage(`Error analyzing file statistics.`);
+        });
+
       } catch (error) {
         console.error("Error reading file:", error);
+        addLog(`Error reading file: ${error}`);
         setStatus('error');
         setStatusMessage('Error: Could not read the selected file.');
         setOriginalFileBuffer(null);
@@ -61,21 +129,41 @@ export default function App() {
         setStatus('idle');
         setStatusMessage('Upload a .ply file to get started.');
     }
-  }, []);
+  }, [addLog]);
 
   const handleReset = () => {
+      addLog("App reset triggered");
       setFile(null);
       setOriginalFileBuffer(null);
-      setReducedFileBuffer(null);
+      setResultViewBuffer(null);
       setReducedBlob(null);
+      setAnalysisData(null);
       setOriginalCount(null);
       setReducedCount(null);
       setStatus('idle');
       setStatusMessage('Upload a .ply file to get started.');
       setIsProcessing(false);
+      setProtectedIndices(new Set());
       setOriginalKey(prev => prev + 1);
       setReducedKey(prev => prev + 1);
+      setOpacityRemoval(10);
+      setSizeRemoval(10);
+      setColorThreshold(0);
   };
+
+  const handleSplatClick = useCallback((index: number) => {
+      setProtectedIndices(prev => {
+          const next = new Set(prev);
+          if (next.has(index)) {
+              next.delete(index); 
+              addLog(`Splat #${index} un-protected`);
+          } else {
+              next.add(index);
+              addLog(`Splat #${index} protected`);
+          }
+          return next;
+      });
+  }, [addLog]);
 
   const handleEyeDropper = async () => {
     if ('EyeDropper' in window) {
@@ -85,6 +173,7 @@ export default function App() {
         const result = await eyeDropper.open();
         setTargetColor(result.sRGBHex);
         if (colorThreshold === 0) setColorThreshold(10); // Auto-enable if it was off
+        addLog(`Color picked: ${result.sRGBHex}`);
       } catch (e) {
         console.log("EyeDropper closed", e);
       }
@@ -100,8 +189,11 @@ export default function App() {
       return;
     }
 
+    addLog("Starting reduction process...");
     setIsProcessing(true);
-    setReducedFileBuffer(null);
+    
+    // Clear the result viewer to show we are working
+    setResultViewBuffer(null);
     setReducedBlob(null);
     
     const statusCallback = (
@@ -111,6 +203,7 @@ export default function App() {
     ) => {
       setStatus(newStatus);
       setStatusMessage(message);
+      addLog(`[Processor] ${message}`);
       if (counts?.original) setOriginalCount(counts.original);
       if (counts?.reduced) setReducedCount(counts.reduced);
     };
@@ -120,14 +213,16 @@ export default function App() {
         opacityRemoval,
         sizeRemoval,
         targetColor,
-        colorThreshold
+        colorThreshold,
+        protectedIndices // Pass the protected set
       };
 
       const resultBlob = await reduceSplatsInFile(file, options, statusCallback);
 
       try {
           const buffer = await resultBlob.arrayBuffer();
-          setReducedFileBuffer(buffer);
+          // Update the result viewer with the NEW buffer
+          setResultViewBuffer(buffer);
           setReducedBlob(resultBlob);
           setReducedKey(prev => prev + 1);
           statusCallback('success', 'Reduction complete! Ready to download.');
@@ -155,10 +250,12 @@ export default function App() {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
+      addLog("File downloaded");
   };
 
   return (
-    <div className="min-h-screen bg-gray-900 text-gray-200 flex flex-col items-center p-4 sm:p-6 lg:p-8 font-sans">
+    <div className="min-h-screen bg-gray-900 text-gray-200 flex flex-col items-center pt-28 p-4 sm:p-6 lg:p-8 font-sans">
+      
       <div className="w-full max-w-7xl mx-auto">
         <Header />
 
@@ -304,35 +401,72 @@ export default function App() {
                 </div>
             </div>
             
-            {/* Right Column: Two Viewers (Original Top, Reduced Bottom) */}
+            {/* Right Column: Two Viewers */}
             <div className="lg:col-span-8 flex flex-col gap-6">
-               
-               {/* Original Viewer */}
-               <div className="flex-1 min-h-[350px] flex flex-col">
-                 <h2 className="text-md font-semibold text-gray-400 mb-2">Original Scene</h2>
-                 <div className="flex-1 bg-black rounded-xl overflow-hidden shadow-inner border border-gray-700 relative">
-                    <PlyViewer key={`orig-${originalKey}`} fileBuffer={originalFileBuffer} />
-                 </div>
-               </div>
 
-               {/* Reduced Viewer */}
-               <div className="flex-1 min-h-[350px] flex flex-col">
-                  <h2 className="text-md font-semibold text-cyan-400 mb-2">
-                      Reduced Scene {reducedCount ? `(${Math.round((reducedCount/ (originalCount || 1)) * 100)}% splats remaining)` : '(Preview)'}
+               {/* 1. RESULT VIEWER (MOVED TO TOP) */}
+               <div className="flex-1 min-h-[400px] flex flex-col">
+                  <h2 className="text-lg font-semibold text-green-400 mb-2">
+                      Optimized Result
+                      {reducedCount && <span className="text-sm text-gray-400 ml-2 font-normal">({Math.round((reducedCount/ (originalCount || 1)) * 100)}% splats kept)</span>}
                   </h2>
-                  <div className="flex-1 bg-black rounded-xl overflow-hidden shadow-inner border border-gray-700 relative">
-                     {reducedFileBuffer ? (
-                         <PlyViewer key={`red-${reducedKey}`} fileBuffer={reducedFileBuffer} />
+                  <div className="flex-1 bg-gray-900 rounded-xl overflow-hidden shadow-inner border border-gray-700 relative">
+                     {resultViewBuffer ? (
+                         <PlyViewer 
+                            key={`red-${reducedKey}`} 
+                            fileBuffer={resultViewBuffer} 
+                            onLog={addLog}
+                            mode="static" 
+                        />
                      ) : (
-                         <div className="w-full h-full flex items-center justify-center text-gray-500 bg-gray-900/20">
+                         <div className="w-full h-full flex flex-col items-center justify-center text-gray-500 bg-gray-900/40">
                              {isProcessing ? (
-                                 <span className="animate-pulse">Processing...</span>
+                                 <>
+                                    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-cyan-400 mb-2"></div>
+                                    <span className="animate-pulse">Processing Splats...</span>
+                                 </>
                              ) : (
-                                 <span>Result will appear here</span>
+                                 <>
+                                    <SparklesIcon className="w-12 h-12 mb-2 opacity-20" />
+                                    <span>Processed result will appear here</span>
+                                 </>
                              )}
                          </div>
                      )}
                   </div>
+               </div>
+               
+               {/* 2. LIVE PREVIEW (MOVED TO BOTTOM) */}
+               <div className="flex-1 min-h-[400px] flex flex-col">
+                 <div className="flex justify-between items-end mb-2">
+                    <h2 className="text-lg font-semibold text-cyan-300 flex items-center gap-2">
+                        <span className="relative flex h-3 w-3">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-3 w-3 bg-cyan-500"></span>
+                        </span>
+                        Live Preview
+                    </h2>
+                    <span className="text-xs text-gray-400">Red splats = Will be removed</span>
+                 </div>
+                 <div className="flex-1 bg-gray-900 rounded-xl overflow-hidden shadow-inner border border-gray-700 relative">
+                    
+                    {/* Construction Banner */}
+                    <div className="absolute top-0 inset-x-0 z-20 pointer-events-none bg-yellow-500/30 border-b border-yellow-500/20 backdrop-blur-[2px] flex items-center justify-center py-1">
+                        <span className="text-yellow-100 text-xs font-bold uppercase tracking-widest shadow-sm">
+                            Under Construction
+                        </span>
+                    </div>
+
+                    <PlyViewer 
+                        key={`orig-${originalKey}`} 
+                        fileBuffer={originalFileBuffer} 
+                        reductionSettings={reductionSettings}
+                        protectedIndices={protectedIndices}
+                        onSplatClick={handleSplatClick}
+                        onLog={addLog}
+                        mode="live" // Tells viewer to apply red shader
+                    />
+                 </div>
                </div>
 
             </div>

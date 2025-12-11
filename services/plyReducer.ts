@@ -14,6 +14,7 @@ interface ReductionOptions {
     sizeRemoval: number;    // 0-100 percentage
     targetColor: string;
     colorThreshold: number; // 0-100 percentage
+    protectedIndices?: Set<number>;
 }
 
 const SH_C0 = 0.28209479177387814;
@@ -127,6 +128,60 @@ const hexToRgb = (hex: string): [number, number, number] => {
     return [r, g, b];
 };
 
+/**
+ * Analyzes the PLY file to extract sorted arrays of opacities and volumes.
+ * This is used to calculate accurate percentiles for the UI slider.
+ */
+export const analyzeFile = async (file: File): Promise<{ opacities: Float32Array, volumes: Float32Array }> => {
+    const buffer = await file.arrayBuffer();
+    const layout = parsePlyHeader(buffer);
+    
+    const propMap = new Map<string, PlyProperty>();
+    layout.properties.forEach(p => propMap.set(p.name, p));
+    const getProp = (keys: string[]) => {
+        for (const k of keys) {
+            if (propMap.has(k)) return propMap.get(k);
+        }
+        return null;
+    };
+
+    const pOpacity = getProp(['opacity', 'alpha']);
+    const pScale0 = getProp(['scale_0', 'scale0']);
+    const pScale1 = getProp(['scale_1', 'scale1']);
+    const pScale2 = getProp(['scale_2', 'scale2']);
+
+    if (!pOpacity || !pScale0) {
+        throw new Error("Could not find opacity or scale properties for analysis.");
+    }
+
+    const dataView = new DataView(buffer, layout.dataStart);
+    const opacities = new Float32Array(layout.vertexCount);
+    const volumes = new Float32Array(layout.vertexCount);
+
+    for (let i = 0; i < layout.vertexCount; i++) {
+        const base = i * layout.rowSize;
+        
+        // Read Opacity (sigmoid)
+        const opacityRaw = getFloatValue(dataView, base + pOpacity.offset, pOpacity.type);
+        const opacity = 1 / (1 + Math.exp(-opacityRaw));
+        opacities[i] = opacity;
+
+        // Read Scale (exp) to Volume
+        const s0 = getFloatValue(dataView, base + pScale0.offset, pScale0.type);
+        const s1 = getFloatValue(dataView, base + pScale1!.offset, pScale1!.type);
+        const s2 = getFloatValue(dataView, base + pScale2!.offset, pScale2!.type);
+        
+        const vol = Math.exp(s0) * Math.exp(s1) * Math.exp(s2);
+        volumes[i] = vol;
+    }
+
+    // Return sorted arrays for percentile lookup
+    return {
+        opacities: opacities.sort(),
+        volumes: volumes.sort()
+    };
+};
+
 export const reduceSplatsInFile = async (
     file: File, 
     options: ReductionOptions,
@@ -159,9 +214,10 @@ export const reduceSplatsInFile = async (
     const pScale1 = getProp(['scale_1', 'scale1']);
     const pScale2 = getProp(['scale_2', 'scale2']);
     
-    const pFdc0 = getProp(['f_dc_0', 'f_dc0', 'red']);
-    const pFdc1 = getProp(['f_dc_1', 'f_dc1', 'green']);
-    const pFdc2 = getProp(['f_dc_2', 'f_dc2', 'blue']);
+    // Robust Color Property Finding
+    const pFdc0 = getProp(['f_dc_0', 'f_dc0', 'red', 'diffuse_red']);
+    const pFdc1 = getProp(['f_dc_1', 'f_dc1', 'green', 'diffuse_green']);
+    const pFdc2 = getProp(['f_dc_2', 'f_dc2', 'blue', 'diffuse_blue']);
 
     if (!pOpacity || !pScale0) {
         throw new Error("Could not find opacity or scale properties in PLY.");
@@ -171,8 +227,6 @@ export const reduceSplatsInFile = async (
     const shToColor = (val: number) => 0.5 + (SH_C0 * val);
 
     // --- Pass 1: Gather Value Distributions ---
-    // We need to know the actual value cutoffs to remove the bottom X%
-    // To do this efficiently without storing millions of objects, we use typed arrays.
     
     statusCallback('calculating', 'Analyzing splat distributions...');
     
@@ -221,11 +275,19 @@ export const reduceSplatsInFile = async (
     
     const indicesToKeep: number[] = [];
     const targetRgb = hexToRgb(options.targetColor);
-    const maxColorDist = 0.8; 
+    // Increased max distance for looser matching
+    const maxColorDist = 1.75; 
     const colorDistThreshold = (options.colorThreshold / 100) * maxColorDist;
     const filterColor = options.colorThreshold > 0;
+    const protectedIndices = options.protectedIndices || new Set();
 
     for (let i = 0; i < layout.vertexCount; i++) {
+        // Force keep if protected
+        if (protectedIndices.has(i)) {
+            indicesToKeep.push(i);
+            continue;
+        }
+
         let keep = true;
 
         // 1. Opacity Check

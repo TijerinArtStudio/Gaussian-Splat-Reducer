@@ -1,175 +1,298 @@
 
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect } from 'react';
+import * as THREE from 'three';
+// @ts-ignore - Importación de Spark y el módulo 'dyno'
+import { SparkRenderer, SplatMesh, SparkControls, dyno } from '@sparkjsdev/spark';
 
-interface PlyViewerProps {
-  title?: string;
-  fileBuffer: ArrayBuffer | null;
+interface ReductionSettings {
+  opacityThreshold: number; // Absolute value computed from percentile
+  sizeThreshold: number;    // Absolute value computed from percentile
+  targetColor: string;
+  colorThreshold: number;   // Percentage (0-100)
 }
 
-const Spinner: React.FC = () => (
-    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-cyan-400"></div>
-);
+interface PlyViewerProps {
+  fileBuffer: ArrayBuffer | null;
+  reductionSettings?: ReductionSettings;
+  protectedIndices?: Set<number>;
+  onSplatClick?: (index: number) => void;
+  onLog?: (msg: string) => void;
+  mode?: 'live' | 'static';
+}
 
-export const PlyViewer: React.FC<PlyViewerProps> = ({ title, fileBuffer }) => {
+const hexToVec3 = (hex: string) => {
+  const c = new THREE.Color(hex);
+  return new THREE.Vector3(c.r, c.g, c.b);
+};
+
+export const PlyViewer: React.FC<PlyViewerProps> = ({
+  fileBuffer: buffer,
+  reductionSettings,
+  protectedIndices,
+  onSplatClick,
+  onLog,
+  mode = 'static'
+}) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const rendererRef = useRef<any>(null); // Store Three.js renderer
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const meshRef = useRef<any>(null);
+  const dynoParamsRef = useRef<any>(null);
 
+  // ========================================================================
+  // BLOQUE 1: LÓGICA COMÚN (Funciona para OPTIMIZED RESULT y LIVE PREVIEW)
+  // Este efecto monta el visor 3D básico.
+  // ========================================================================
   useEffect(() => {
-    // We only initialize if we have a file buffer to show
-    if (!fileBuffer || !containerRef.current) return;
+    if (!buffer || !containerRef.current) return;
 
-    let scene: any, camera: any, renderer: any, controls: any, splatMesh: any;
-    let animationId: number;
+    if (onLog) onLog(`[${mode.toUpperCase()}] Starting Core Viewer...`);
+
+    let renderer: THREE.WebGLRenderer;
+    let scene: THREE.Scene;
+    let camera: THREE.PerspectiveCamera;
+    let controls: any;
+    let splatMesh: any;
     let blobUrl: string | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let mounted = true;
 
-    const initViewer = async () => {
-      setIsLoading(true);
-      setError(null);
+    try {
+      // 1. Configuración del Canvas (Igual para ambos)
+      containerRef.current.innerHTML = '';
+      const canvas = document.createElement('canvas');
+      canvas.style.width = '100%';
+      canvas.style.height = '100%';
+      canvas.style.display = 'block';
+      canvas.style.position = 'absolute';
+      canvas.style.inset = '0';
+      containerRef.current.appendChild(canvas);
+      
+      const width = containerRef.current.clientWidth || 800;
+      const height = containerRef.current.clientHeight || 600;
 
-      try {
-        // 1. Dynamic Imports
-        const THREE = await import('three');
-        const { OrbitControls } = await import('three/addons/controls/OrbitControls.js');
-        const { SplatMesh } = await import('@sparkjsdev/spark');
+      // 2. Configuración Three.js + Spark (Igual para ambos)
+      renderer = new THREE.WebGLRenderer({ 
+          canvas, 
+          antialias: false, 
+          alpha: false,
+          powerPreference: 'high-performance'
+      });
+      renderer.setSize(width, height, false);
+      renderer.setClearColor(new THREE.Color(0x111827), 1);
 
-        if (!mounted) return;
+      scene = new THREE.Scene();
+      const spark = new SparkRenderer({ renderer });
+      scene.add(spark);
 
-        // 2. Setup Basic Three.js Scene
-        const width = containerRef.current!.clientWidth;
-        const height = containerRef.current!.clientHeight;
+      camera = new THREE.PerspectiveCamera(60, width / height, 0.01, 1000);
+      camera.position.set(0, 0, 5);
 
-        scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x000000); // Black background
+      controls = new SparkControls({ canvas });
 
-        camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 1000);
-        camera.position.set(0, 0, 5);
-        camera.up.set(0, 1, 0);
+      // 3. Carga del Archivo PLY (Igual para ambos)
+      const blob = new Blob([buffer]);
+      blobUrl = URL.createObjectURL(blob);
+      
+      splatMesh = new SplatMesh({
+          url: blobUrl,
+          // Callback vacío, necesario para evitar errores si Spark intenta llamar listeners
+          onFrame: () => {} 
+      });
 
-        renderer = new THREE.WebGLRenderer({ 
-            antialias: false, // Performance optimization for dual viewers
-            alpha: false,
-            powerPreference: 'high-performance'
-        });
-        
-        // Pass false as third argument to prevent style modification which causes ResizeObserver loops
-        renderer.setSize(width, height, false);
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Limit pixel ratio for perf
-        
-        // We handle styles via CSS
-        renderer.domElement.style.display = 'block';
-        renderer.domElement.style.width = '100%';
-        renderer.domElement.style.height = '100%';
-        
-        containerRef.current!.appendChild(renderer.domElement);
-        rendererRef.current = renderer;
+      scene.add(splatMesh);
+      meshRef.current = splatMesh;
 
-        // 3. Controls
-        controls = new OrbitControls(camera, renderer.domElement);
-        controls.enableDamping = true;
-        controls.dampingFactor = 0.05;
+      // 4. Interacción / Clicks (Igual para ambos)
+      const raycaster = new THREE.Raycaster();
+      raycaster.params.Points.threshold = 0.05;
+      
+      const handleClick = (e: MouseEvent) => {
+          if (!onSplatClick) return;
+          const rect = canvas.getBoundingClientRect();
+          const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+          const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+          raycaster.setFromCamera(new THREE.Vector2(x, y), camera);
+          const intersects = raycaster.intersectObject(splatMesh);
+          if (intersects.length > 0 && intersects[0].index !== undefined) {
+              onSplatClick(intersects[0].index);
+          }
+      };
+      canvas.addEventListener('click', handleClick);
 
-        // 4. Load Splat using Blob URL
-        const blob = new Blob([fileBuffer]);
-        blobUrl = URL.createObjectURL(blob);
+      // 5. Resize y Loop de Renderizado (Igual para ambos)
+      resizeObserver = new ResizeObserver((entries) => {
+           window.requestAnimationFrame(() => {
+               if (!mounted || !containerRef.current) return;
+               for (let entry of entries) {
+                  const { width, height } = entry.contentRect;
+                  if (width > 0 && height > 0) {
+                      renderer.setSize(width, height, false);
+                      camera.aspect = width / height;
+                      camera.updateProjectionMatrix();
+                  }
+               }
+          });
+      });
+      resizeObserver.observe(containerRef.current);
 
-        splatMesh = new SplatMesh({ url: blobUrl });
-        scene.add(splatMesh);
-
-        // 5. Animation Loop
-        const animate = () => {
+      renderer.setAnimationLoop(() => {
           if (!mounted) return;
-          animationId = requestAnimationFrame(animate);
-          controls.update();
+          controls.update(camera);
           renderer.render(scene, camera);
-        };
-        animate();
+      });
 
-        // 6. Handle Window Resize
-        const onResize = () => {
-            // Wrap in requestAnimationFrame to avoid "ResizeObserver loop completed with undelivered notifications"
-            // This decouples the sizing from the observation callback loop
-            window.requestAnimationFrame(() => {
-                if (!mounted || !containerRef.current || !camera || !renderer) return;
-                const w = containerRef.current.clientWidth;
-                const h = containerRef.current.clientHeight;
-                camera.aspect = w / h;
-                camera.updateProjectionMatrix();
-                
-                // IMPORTANT: updateStyle = false to prevent touching DOM styles
-                renderer.setSize(w, h, false);
-            });
-        };
-        
-        resizeObserver = new ResizeObserver(() => onResize());
-        resizeObserver.observe(containerRef.current!);
+      if (onLog) onLog(`[${mode.toUpperCase()}] Core Viewer Ready.`);
 
-        setIsLoading(false);
+    } catch (e: any) {
+      console.error("Viewer Setup Error:", e);
+      if (onLog) onLog(`[ERROR] ${e.message}`);
+    }
 
-      } catch (err: any) {
-        console.error("3D Error:", err);
-        setError(`Failed to initialize 3D Viewer: ${err.message}`);
-        setIsLoading(false);
-      }
-    };
-
-    initViewer();
-
-    // Cleanup function
     return () => {
       mounted = false;
-      if (resizeObserver) resizeObserver.disconnect();
-      if (animationId) cancelAnimationFrame(animationId);
-      if (blobUrl) URL.revokeObjectURL(blobUrl);
-      
-      if (rendererRef.current) {
-        const r = rendererRef.current;
-        r.dispose();
-        // Crucial for dual viewers to prevent context limits
-        r.forceContextLoss(); 
-        if (r.domElement && r.domElement.parentNode) {
-            r.domElement.parentNode.removeChild(r.domElement);
-        }
-        rendererRef.current = null;
+      if (renderer) {
+          renderer.setAnimationLoop(null);
+          renderer.dispose();
+          renderer.forceContextLoss();
       }
-      if (splatMesh && splatMesh.dispose) splatMesh.dispose();
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+      if (resizeObserver) resizeObserver.disconnect();
     };
-  }, [fileBuffer]);
+  }, [buffer]);
+
+  // ========================================================================
+  // BLOQUE 2: SOLO LIVE PREVIEW (Inyección de Shaders)
+  // El 'Optimized Result' NUNCA ejecuta esto (porque mode='static').
+  // ========================================================================
+  useEffect(() => {
+    // Si no es Live, salimos inmediatamente.
+    if (mode !== 'live' || !meshRef.current) return;
+
+    if (!dyno) {
+        if (onLog) onLog("[WARN] 'dyno' module missing. Showing static mesh.");
+        return;
+    }
+
+    if (onLog) onLog("[LIVE] Injecting Shader Graph...");
+
+    try {
+        // A. Definir Inputs
+        const params = {
+            opacityThreshold: dyno.dynoFloat(0.0),
+            scaleThreshold: dyno.dynoFloat(0.0),
+            targetColor: dyno.dynoVec3(new THREE.Vector3(1, 1, 1)),
+            colorThreshold: dyno.dynoFloat(0.0),
+            isActive: dyno.dynoBool(true) 
+        };
+        dynoParamsRef.current = params;
+
+        // B. Definir Shader Graph
+        const reductionLogic = dyno.dynoBlock(
+            { gsplat: dyno.Gsplat }, 
+            { gsplat: dyno.Gsplat }, 
+            ({ gsplat }: any) => {
+                const split = dyno.splitGsplat(gsplat);
+                // Handle different Spark versions return structures
+                const outputs = (split as any).outputs || split;
+                const { scales, opacity, rgb } = outputs;
+                
+                // Calcular volumen aproximado
+                const volume = dyno.mul(dyno.mul(scales.x, scales.y), scales.z);
+                
+                // Distancia de color
+                const colorDiff = dyno.sub(rgb, params.targetColor);
+                const colorDist = dyno.length(colorDiff);
+
+                // Condiciones
+                const isLowOpacity = dyno.lessThan(opacity, params.opacityThreshold);
+                const isSmall = dyno.lessThan(volume as any, params.scaleThreshold);
+                const isColorMatch = dyno.and(
+                      dyno.greaterThan(params.colorThreshold, dyno.dynoFloat(0.001)),
+                      dyno.lessThan(colorDist, params.colorThreshold)
+                );
+
+                // Lógica final: ¿Debe borrarse?
+                const shouldRemove = dyno.or(isLowOpacity as any, dyno.or(isSmall as any, isColorMatch as any) as any);
+
+                // Color rojo para visualización
+                const redColor = dyno.dynoVec3(new THREE.Vector3(1.0, 0.0, 0.0));
+                
+                // Selección condicional
+                const finalRgb = dyno.select(
+                    shouldRemove as any, 
+                    redColor, 
+                    rgb
+                );
+
+                return { 
+                    gsplat: dyno.combineGsplat({ gsplat, rgb: finalRgb }) 
+                };
+            }
+        );
+
+        // C. Aplicar al Mesh
+        meshRef.current.worldModifier = reductionLogic;
+        
+        // D. Forzar recompilación del shader
+        if (meshRef.current.updateGenerator) {
+            meshRef.current.updateGenerator();
+        }
+
+        if (onLog) onLog("[LIVE] Shader injected successfully.");
+
+    } catch (e: any) {
+        console.error("Error building dyno graph:", e);
+        if (onLog) onLog(`[LIVE ERROR] Failed to inject shader: ${e.message}`);
+        
+        // FALLBACK DE SEGURIDAD:
+        if (meshRef.current) {
+           meshRef.current.worldModifier = null;
+           if (meshRef.current.updateGenerator) meshRef.current.updateGenerator();
+        }
+    }
+  }, [mode, buffer]);
+
+  // ========================================================================
+  // BLOQUE 3: SOLO LIVE PREVIEW (Actualización de Valores)
+  // ========================================================================
+  useEffect(() => {
+    if (mode !== 'live' || !reductionSettings || !meshRef.current || !dynoParamsRef.current) return;
+
+    const { opacityThreshold, sizeThreshold, targetColor, colorThreshold } = reductionSettings;
+    const params = dynoParamsRef.current;
+
+    try {
+        // 1. Actualizar valores en los objetos dyno
+        // IMPORTANT: We now pass the absolute threshold values derived from statistics
+        params.opacityThreshold.value = opacityThreshold;
+        params.scaleThreshold.value = sizeThreshold;
+        
+        params.targetColor.value = hexToVec3(targetColor);
+        // Color threshold remains percentage based (0-1 mapped to distance)
+        params.colorThreshold.value = (colorThreshold / 100.0) * 1.75;
+        
+        // 2. Notificar cambio de versión (Ligero)
+        if (meshRef.current.updateVersion) {
+            meshRef.current.updateVersion();
+        } else if (meshRef.current.updateGenerator) {
+           meshRef.current.updateGenerator();
+        }
+
+    } catch (e) {
+        console.error("Error updating uniforms", e);
+    }
+  }, [
+    mode,
+    reductionSettings?.opacityThreshold,
+    reductionSettings?.sizeThreshold,
+    reductionSettings?.targetColor,
+    reductionSettings?.colorThreshold
+  ]);
 
   return (
-    <div className="flex flex-col h-full w-full relative">
-      {title && <h3 className="text-lg font-semibold text-cyan-400 mb-3 text-center">{title}</h3>}
-      
-      <div 
-        ref={containerRef}
-        className="flex-grow w-full h-full relative overflow-hidden bg-black rounded-lg shadow-inner"
-      >
-        {/* Status Overlays */}
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none z-10">
-            {isLoading && (
-               <div className="flex flex-col items-center space-y-3 bg-gray-900/80 px-8 py-6 rounded-xl backdrop-blur-md border border-gray-700">
-                    <Spinner />
-                    <span className="text-cyan-200 text-sm font-medium tracking-wide">Initializing Engine...</span>
-                </div>
-            )}
-
-            {!fileBuffer && !isLoading && !error && (
-              <div className="text-gray-500 text-lg font-medium bg-gray-900/80 px-6 py-4 rounded-xl backdrop-blur-sm border border-gray-700">
-                  Ready.
-              </div>
-            )}
-
-            {error && (
-                <div className="bg-red-900/90 text-white px-8 py-6 rounded-xl text-center shadow-xl border border-red-500/50 backdrop-blur-md max-w-md">
-                    <p className="font-bold text-lg mb-2">Error</p>
-                    <p className="text-red-200 text-sm">{error}</p>
-                </div>
-            )}
-        </div>
-      </div>
-    </div>
+    <div
+      ref={containerRef}
+      className="w-full h-full relative bg-gray-900"
+      style={{ minHeight: '100%' }}
+    />
   );
 };
