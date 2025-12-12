@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Ensure canvas doesn't have weird selection issues */
+canvas { 
+    outline: none; 
+    -webkit-tap-highlight-color: transparent; 
+}
